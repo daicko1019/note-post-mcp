@@ -50,6 +50,24 @@ async function waitForPublished(context: BrowserContext, editorUrl: string, time
 }
 
 // 現在時刻のフォーマット
+// 画像の多い記事は縦に長く、全体のスクリーンショットが撮れないことがある（Page.captureScreenshot の失敗、2026-09 確認）。
+// 保存や公開は済んでいるので、撮れなければ見えている範囲だけ撮り、それも駄目なら warnings に出して続ける
+async function takeScreenshot(page: Page, screenshotPath: string, warnings: string[]): Promise<string | undefined> {
+  try {
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    return screenshotPath;
+  } catch {
+    try {
+      await page.screenshot({ path: screenshotPath });
+      warnings.push('ページ全体のスクリーンショットが撮れなかったので、見えている範囲だけ撮りました');
+      return screenshotPath;
+    } catch (e) {
+      warnings.push(`スクリーンショットを撮れませんでした: ${e instanceof Error ? e.message.split('\n')[0] : String(e)}`);
+      return undefined;
+    }
+  }
+}
+
 function nowStr(): string {
   const d = new Date();
   const z = (n: number) => String(n).padStart(2, '0');
@@ -66,6 +84,10 @@ interface ImageInfo {
 
 // 画像の記法: ![代替テキスト（ALT）](パス "キャプション")。キャプションは省略できる
 const IMAGE_MD = /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/;
+// 画像にリンクを付ける記法: [![ALT](パス "キャプション")](URL)。1行に画像1つだけ
+const LINKED_IMAGE_MD = /^\s*\[(!\[[^\]]*\]\([^)]*\))\]\((https?:\/\/[^)\s]+)\)\s*$/;
+// 文中のリンク: [文字](URL)。同じ URL を単独の行に置くとリンクカードになるが、同じサイトのカードは見分けがつかないので文字で張る
+const TEXT_LINK_MD = /(?<!!)\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
 
 // Markdownから画像パスを抽出する関数
 function extractImages(markdown: string, baseDir: string): ImageInfo[] {
@@ -341,7 +363,7 @@ async function postToNote(params: {
     let previousLineWasList = false; // 前の行がリスト項目だったかを追跡
     let previousLineWasQuote = false; // 前の行が引用だったかを追跡
     let previousLineWasHorizontalRule = false; // 前の行が水平線だったかを追跡
-    const pastedImages: { alt: string; caption: string }[] = []; // 貼り付けた画像の ALT とキャプション（本文入力後に入れる）
+    const pastedImages: { alt: string; caption: string; link: string }[] = []; // 貼り付けた画像の ALT・キャプション・リンク（本文入力後に入れる）
     const warnings: string[] = [];
 
     for (let i = 0; i < lines.length; i++) {
@@ -408,8 +430,9 @@ async function postToNote(params: {
       }
       previousLineWasHorizontalRule = false;
       
-      // 画像マークダウンを検出
-      const imageMatch = line.match(IMAGE_MD);
+      // 画像マークダウンを検出（リンク付きなら、リンクの中の画像の記法を見る）
+      const linkedImage = line.match(LINKED_IMAGE_MD);
+      const imageMatch = (linkedImage ? linkedImage[1] : line).match(IMAGE_MD);
       if (imageMatch) {
         const imagePath = imageMatch[2];
         // ローカルパスの画像をアップロード
@@ -472,7 +495,7 @@ async function postToNote(params: {
             await page.waitForTimeout(300);
 
             log('Inline image pasted');
-            pastedImages.push({ alt: imageMatch[1], caption: imageMatch[3] ?? '' });
+            pastedImages.push({ alt: imageMatch[1], caption: imageMatch[3] ?? '', link: linkedImage?.[2] ?? '' });
 
             // 画像の後に改行してテキストボックスに戻る
             if (!isLastLine) {
@@ -521,7 +544,58 @@ async function postToNote(params: {
         processedLine = processedLine.replace(/^>\s?/, '');
       }
       
-      await page.keyboard.type(processedLine);
+      // 文中のリンクは、文字を打ってから Shift+← で選び、選択時の操作バーの「リンク」で張る
+      let typedFrom = 0;
+      for (const m of processedLine.matchAll(TEXT_LINK_MD)) {
+        await page.keyboard.type(processedLine.slice(typedFrom, m.index));
+        await page.keyboard.type(m[1]);
+        typedFrom = (m.index ?? 0) + m[0].length;
+        try {
+          for (let k = 0; k < Array.from(m[1]).length; k++) await page.keyboard.press('Shift+ArrowLeft');
+          // 選択時の操作バーの「リンク」を押す。画像の操作バーにも同じ「リンク」があるので、「太字」と同じ操作バーのものを探す。
+          // キャレットが画面の下端にあると操作バーが画面の外に出て押せない（2026-09 確認）ので、そのときはスクロールしてから押す
+          const aiTip = page.locator('[role="dialog"]', { hasText: 'AIと構成づくり' });
+          if (await aiTip.isVisible().catch(() => false)) {
+            await aiTip.getByRole('button', { name: '閉じる' }).click({ timeout: 3000 }).catch(() => {});
+          }
+          let clickedLink = false;
+          for (let attempt = 0; attempt < 3 && !clickedLink; attempt++) {
+            const linkBtn = await page.waitForFunction(() => {
+              const bold = Array.from(document.querySelectorAll('button[aria-label="太字"]')).find((b) => b.getBoundingClientRect().width > 0);
+              let el = bold?.parentElement;
+              while (el && !el.querySelector('button[aria-label="リンク"]')) el = el.parentElement;
+              return el?.querySelector('button[aria-label="リンク"]') ?? null;
+            }, null, { timeout: 5000 });
+            const offset = await linkBtn.evaluate((b) => {
+              const r = (b as Element).getBoundingClientRect();
+              return r.top < 0 || r.bottom > window.innerHeight ? r.top - window.innerHeight / 2 : 0;
+            });
+            if (offset) {
+              await page.mouse.wheel(0, offset);
+              await page.waitForTimeout(500);
+              continue;
+            }
+            await linkBtn.asElement()!.click({ timeout: 5000 });
+            clickedLink = true;
+          }
+          if (!clickedLink) throw new Error('操作バーの「リンク」が画面の中に出ない');
+          await page.locator('textarea[placeholder="https://"]:visible').fill(m[2], { timeout: 5000 });
+          await page.getByRole('button', { name: '適用', exact: true }).click({ timeout: 5000 });
+          await page.waitForTimeout(300);
+        } catch (e) {
+          await page.keyboard.press('Escape').catch(() => {});
+          warnings.push(`文中のリンクを張れませんでした（${m[1]}）: ${e instanceof Error ? e.message.split('\n')[0] : String(e)}`);
+        }
+        // 選択を解いてリンクの直後へ。適用後にエディタからフォーカスが外れていたら、その段落の末尾に戻す
+        const focused = await bodyBox.evaluate((el) => el.contains(document.activeElement));
+        if (!focused) {
+          await bodyBox.locator(':scope > p').last().click();
+          await page.keyboard.press('End');
+        } else {
+          await page.keyboard.press('ArrowRight');
+        }
+      }
+      await page.keyboard.type(processedLine.slice(typedFrom));
       
       // 次の行のために、現在の行の状態を記録
       previousLineWasList = isCurrentLineList;
@@ -582,15 +656,60 @@ async function postToNote(params: {
     if (figureCount !== pastedImages.length) {
       warnings.push(`画像の数が合わないためキャプションと ALT を入れていません（本文の画像 ${figureCount} / 貼り付け ${pastedImages.length}）`);
     } else {
+      // 画像 i を選ぶ。前の画像に ALT を入れた直後は、クリックしても選択が移らないことがあり、
+      // 次の画像のリンクが前の画像に入った（2026-09 確認）。選ばれた印（ProseMirror-selectednode）を確かめる
+      const selectImage = async (i: number) => {
+        const fig = imageFigures.nth(i);
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await page.keyboard.press('Escape');
+          await fig.locator('img').scrollIntoViewIfNeeded();
+          await fig.locator('img').click();
+          for (let k = 0; k < 5; k++) {
+            await page.waitForTimeout(200);
+            if (await fig.evaluate((f) => f.classList.contains('ProseMirror-selectednode'))) return;
+          }
+        }
+        throw new Error('画像を選べない');
+      };
       for (let i = 0; i < pastedImages.length; i++) {
-        const { alt, caption: captionText } = pastedImages[i];
+        const { alt, caption: captionText, link } = pastedImages[i];
         if (captionText.trim()) {
-          const caption = imageFigures.nth(i).locator('figcaption');
-          await caption.scrollIntoViewIfNeeded();
-          await caption.click();
-          await page.keyboard.type(captionText);
-          if ((await caption.textContent())?.trim() !== captionText.trim()) {
-            warnings.push(`キャプションが入りませんでした: ${captionText}`);
+          // キャレットがこの画像のキャプション欄に入ったことを確かめてから打つ。
+          // 画像8枚の記事で、キャプションが本文の段落として打たれ、途中で止まった（2026-09 確認）
+          try {
+            await page.keyboard.press('Escape');
+            const caption = imageFigures.nth(i).locator('figcaption');
+            await caption.scrollIntoViewIfNeeded({ timeout: 5000 });
+            await caption.click({ timeout: 5000 });
+            await page.waitForTimeout(200);
+            const inCaption = await caption.evaluate((el) => {
+              const node = window.getSelection()?.anchorNode;
+              return !!node && el.contains(node);
+            });
+            if (!inCaption) throw new Error('キャプション欄にキャレットを置けない');
+            await page.keyboard.type(captionText);
+            if ((await caption.textContent())?.trim() !== captionText.trim()) throw new Error('キャプション欄に反映されない');
+          } catch (e) {
+            warnings.push(`キャプションを入れられませんでした（画像 ${i + 1}）: ${e instanceof Error ? e.message.split('\n')[0] : String(e)}`);
+          }
+        }
+
+        // リンク: 画像を選ぶと出る操作バーの「リンク」から入れる
+        if (link) {
+          try {
+            await selectImage(i);
+            await page.locator('[role="toolbar"] button[aria-label="リンク"]').click({ timeout: 5000 });
+            await page.locator('textarea[placeholder="https://"]:visible').fill(link, { timeout: 5000 });
+            await page.getByRole('button', { name: '適用', exact: true }).click({ timeout: 5000 });
+            let href: string | null = null;
+            for (let k = 0; k < 10 && href !== link; k++) {
+              await page.waitForTimeout(300);
+              href = await imageFigures.nth(i).evaluate((f) => f.querySelector('a[href]')?.getAttribute('href') ?? null);
+            }
+            if (href !== link) throw new Error(`figure のリンクに反映されない（${href}）`);
+          } catch (e) {
+            await page.keyboard.press('Escape').catch(() => {});
+            warnings.push(`画像のリンクを入れられませんでした（画像 ${i + 1}）: ${e instanceof Error ? e.message.split('\n')[0] : String(e)}`);
           }
         }
 
@@ -601,8 +720,7 @@ async function postToNote(params: {
         }
         try {
           const img = imageFigures.nth(i).locator('img');
-          await img.scrollIntoViewIfNeeded();
-          await img.click();
+          await selectImage(i);
           await page.locator('[role="toolbar"] button[aria-label="代替テキスト"]').click({ timeout: 5000 });
           await page.locator('textarea[placeholder^="例: "]').fill(alt, { timeout: 5000 });
           await page.getByRole('button', { name: '適用', exact: true }).click({ timeout: 5000 });
@@ -619,7 +737,22 @@ async function postToNote(params: {
     const tocMarker = bodyBox.locator('p', { hasText: /^\s*\[目次\]\s*$/ }).first();
     if (await tocMarker.count()) {
       try {
-        await tocMarker.click();
+        // キャレットが「[目次]」の段落に入ったことを確かめてから消す。
+        // 直前に ALT を入れた画像が選ばれたままクリックが効かず、Backspace でその画像が消えて同じ場所に目次が入った（2026-09 確認）
+        const imagesBeforeToc = await bodyBox.locator('figure:has(img)').count();
+        await page.keyboard.press('Escape');
+        let inMarker = false;
+        for (let attempt = 0; attempt < 3 && !inMarker; attempt++) {
+          await tocMarker.evaluate((el) => el.scrollIntoView({ block: 'center' }));
+          await tocMarker.click();
+          await page.waitForTimeout(300);
+          inMarker = await page.evaluate(() => {
+            const node = window.getSelection()?.anchorNode;
+            const el = node instanceof Element ? node : node?.parentElement;
+            return el?.closest('p')?.textContent?.trim() === '[目次]';
+          });
+        }
+        if (!inMarker) throw new Error('「[目次]」の段落にキャレットを置けない');
         await page.keyboard.press('End');
         await page.keyboard.press('Shift+Home');
         await page.keyboard.press('Backspace');
@@ -627,6 +760,7 @@ async function postToNote(params: {
         await page.locator('button#toc-setting').click({ timeout: 5000 });
         await page.waitForTimeout(1000);
         if (!(await bodyBox.locator('table-of-contents').count())) throw new Error('目次ブロックが見つからない');
+        if ((await bodyBox.locator('figure:has(img)').count()) !== imagesBeforeToc) throw new Error('目次を入れる操作で画像の数が変わった');
         log('Table of contents inserted');
       } catch (e) {
         await page.keyboard.press('Escape').catch(() => {});
@@ -645,7 +779,7 @@ async function postToNote(params: {
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
       }
 
-      await page.screenshot({ path: screenshotPath, fullPage: true });
+      const screenshot = await takeScreenshot(page, screenshotPath, warnings);
       const finalUrl = page.url();
       log('Draft saved', { url: finalUrl });
 
@@ -655,7 +789,7 @@ async function postToNote(params: {
       return {
         success: true,
         url: finalUrl,
-        screenshot: screenshotPath,
+        screenshot,
         message: '下書きを保存しました',
         ...(warnings.length ? { warnings } : {}),
       };
@@ -709,7 +843,7 @@ async function postToNote(params: {
     ]);
 
     const publishedUrl = await waitForPublished(context, page.url());
-    await page.screenshot({ path: screenshotPath, fullPage: true });
+    const screenshot = await takeScreenshot(page, screenshotPath, warnings);
     if (!publishedUrl) {
       throw new Error(`投稿後、記事が公開の状態になったことを確認できませんでした（下書きのまま残っている可能性があります）: ${page.url()}`);
     }
@@ -721,7 +855,7 @@ async function postToNote(params: {
     return {
       success: true,
       url: publishedUrl,
-      screenshot: screenshotPath,
+      screenshot,
       message: '記事を公開しました',
       ...(warnings.length ? { warnings } : {}),
     };
