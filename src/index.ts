@@ -656,12 +656,23 @@ async function postToNote(params: {
       for (let i = 0; i < pastedImages.length; i++) {
         const { alt, caption: captionText, link } = pastedImages[i];
         if (captionText.trim()) {
-          const caption = imageFigures.nth(i).locator('figcaption');
-          await caption.scrollIntoViewIfNeeded();
-          await caption.click();
-          await page.keyboard.type(captionText);
-          if ((await caption.textContent())?.trim() !== captionText.trim()) {
-            warnings.push(`キャプションが入りませんでした: ${captionText}`);
+          // キャレットがこの画像のキャプション欄に入ったことを確かめてから打つ。
+          // 画像8枚の記事で、キャプションが本文の段落として打たれ、途中で止まった（2026-09 確認）
+          try {
+            await page.keyboard.press('Escape');
+            const caption = imageFigures.nth(i).locator('figcaption');
+            await caption.scrollIntoViewIfNeeded({ timeout: 5000 });
+            await caption.click({ timeout: 5000 });
+            await page.waitForTimeout(200);
+            const inCaption = await caption.evaluate((el) => {
+              const node = window.getSelection()?.anchorNode;
+              return !!node && el.contains(node);
+            });
+            if (!inCaption) throw new Error('キャプション欄にキャレットを置けない');
+            await page.keyboard.type(captionText);
+            if ((await caption.textContent())?.trim() !== captionText.trim()) throw new Error('キャプション欄に反映されない');
+          } catch (e) {
+            warnings.push(`キャプションを入れられませんでした（画像 ${i + 1}）: ${e instanceof Error ? e.message.split('\n')[0] : String(e)}`);
           }
         }
 
