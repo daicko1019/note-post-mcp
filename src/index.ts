@@ -84,7 +84,8 @@ function parseMarkdown(content: string): {
   body: string;
   tags: string[];
 } {
-  const lines = content.split('\n');
+  // CRLF のままだと各行末の \r が keyboard.type で Enter として打たれ、段落が分かれて空行が増える（2026-09 確認）
+  const lines = content.replace(/\r\n?/g, '\n').split('\n');
   let title = '';
   let body = '';
   const tags: string[] = [];
@@ -400,10 +401,14 @@ async function postToNote(params: {
             log('Pasting inline image', { path: imageInfo.absolutePath });
             
             // 画像をクリップボードにコピーしてペーストする方法
-            // 1. 改行して新しい行を作成
-            await page.keyboard.press('Enter');
-            await page.waitForTimeout(300);
-            
+            // 1. 前の行の処理（または本文の先頭）で既に新しい行にいるので、ここでは改行しない。
+            //    改行すると画像の前に空行が1つ残る（2026-09 確認）。
+            //    ただしリスト・引用の直後は空の項目の中にいるので、改行して抜けてから貼る
+            if (previousLineWasList || previousLineWasQuote) {
+              await page.keyboard.press('Enter');
+              await page.waitForTimeout(300);
+            }
+            const figuresBefore = await bodyBox.locator('figure:has(img)').count();
             // 2. 画像ファイルをクリップボードにコピー
             const imageBuffer = fs.readFileSync(imageInfo.absolutePath);
             const base64Image = imageBuffer.toString('base64');
@@ -436,9 +441,18 @@ async function postToNote(params: {
               await page.keyboard.press('Control+v');
             }
             
-            // ペースト完了を待つ
-            await page.waitForTimeout(2000);
-            
+            // ペースト完了を待つ。画像が本文に入り、アップロードが終わるまで待つ。
+            // 固定の待ち時間だと、新規記事の最初の貼り付けで画像が入る前に次の Enter が押され、
+            // 後から入った画像のキャプションへキャレットが移って本文がキャプションに入った（2026-09 確認）
+            const uploaded = await page.waitForFunction((before) => {
+              const imgs = Array.from(document.querySelectorAll<HTMLImageElement>('div[contenteditable="true"][role="textbox"] figure img'));
+              return imgs.length > before && imgs.every((img) => /^https:\/\/assets\.st-note\.com\//.test(img.src));
+            }, figuresBefore, { timeout: 30000 }).then(() => true).catch(() => false);
+            if (!uploaded) {
+              warnings.push(`画像のアップロードを確認できませんでした: ${imagePath}`);
+            }
+            await page.waitForTimeout(300);
+
             log('Inline image pasted');
             imageCaptions.push(imageMatch[1]);
 
@@ -517,6 +531,31 @@ async function postToNote(params: {
     }
     
     log('Body set');
+
+    // 本文が画像で始まると、エディタに最初からある空段落が画像の上に残る。
+    // その段落で Delete を押すと、段落が消えて下の画像が選択された状態になる。
+    // キャプションを入れた後だとキャレットがキャプションに残ることがあるので、その前にやる
+    const hasLeadingBlank = () => bodyBox.evaluate((el) => {
+      const first = el.firstElementChild;
+      return !!first && first.tagName === 'P' && !first.textContent?.trim() && first.nextElementSibling?.tagName === 'FIGURE';
+    });
+    if (await hasLeadingBlank()) {
+      // 新規記事では最初の Delete が効かないことがある（段落に class が付くだけ）。先頭へ移動して押し直す
+      for (let attempt = 0; attempt < 3 && (await hasLeadingBlank()); attempt++) {
+        if (attempt === 0) {
+          await bodyBox.locator(':scope > p').first().click();
+        } else {
+          await page.keyboard.press(process.platform === 'darwin' ? 'Meta+ArrowUp' : 'Control+Home');
+        }
+        await page.keyboard.press('Delete');
+        await page.waitForTimeout(800);
+      }
+      if (await hasLeadingBlank()) {
+        warnings.push('本文の先頭の空行を消せませんでした');
+      } else {
+        log('Leading blank paragraph removed');
+      }
+    }
 
     // 画像キャプション: 入力中にキャプションへ移るとキャレット位置が崩れるため、本文を入れ終えてから入れる。
     // 引用やリンクカードも figure だが img を含まないので、figure:has(img) で画像だけを数える。
