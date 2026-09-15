@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { chromium, type Locator, type Page } from 'playwright';
+import { chromium, type BrowserContext, type Locator, type Page } from 'playwright';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -32,6 +32,21 @@ function log(message: string, data?: any) {
 // aria-label はボタン自身に付く場合と、内側の svg に付く場合がある（2026-08 の UI 変更で svg 側へ移動）
 function byAriaLabel(page: Page, label: string): Locator {
   return page.locator(`button[aria-label="${label}"], button:has(svg[aria-label="${label}"])`);
+}
+
+// 公開の成否は画面ではなく記事の状態で判定する。投稿後も URL が /publish/ のまま残ることがあり、
+// 画面の変化や固定の待ち時間で判定すると、失敗しても成功と返してしまう（2026-09 確認）
+async function waitForPublished(context: BrowserContext, editorUrl: string, timeoutMs = 30000): Promise<string | null> {
+  const key = editorUrl.match(/\/notes\/(n[0-9a-z]+)\//)?.[1];
+  if (!key) return null;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await context.request.get(`https://note.com/api/v3/notes/${key}`).catch(() => null);
+    const data = res && res.ok() ? (await res.json().catch(() => null))?.data : null;
+    if (data?.status === 'published') return data.note_url || `https://note.com/notes/${key}`;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  return null;
 }
 
 // 現在時刻のフォーマット
@@ -669,16 +684,19 @@ async function postToNote(params: {
       page.waitForTimeout(5000),
     ]);
 
+    const publishedUrl = await waitForPublished(context, page.url());
     await page.screenshot({ path: screenshotPath, fullPage: true });
-    const finalUrl = page.url();
-    log('Published', { url: finalUrl });
+    if (!publishedUrl) {
+      throw new Error(`投稿後、記事が公開の状態になったことを確認できませんでした（下書きのまま残っている可能性があります）: ${page.url()}`);
+    }
+    log('Published', { url: publishedUrl });
 
     await context.close();
     await browser.close();
 
     return {
       success: true,
-      url: finalUrl,
+      url: publishedUrl,
       screenshot: screenshotPath,
       message: '記事を公開しました',
       ...(warnings.length ? { warnings } : {}),

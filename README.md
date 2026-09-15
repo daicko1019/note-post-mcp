@@ -222,7 +222,7 @@ Publishes an article to note.com from a Markdown file.
 
 - **Outputs**: JSON object with:
   - `success` (boolean): Whether the operation succeeded
-  - `url` (string): URL of the published article
+  - `url` (string): URL of the published article (`https://note.com/<user>/n/<key>`). Success is decided by the article's status in note's API becoming `published`; if that is not confirmed within 30 seconds, the tool returns an error instead
   - `screenshot` (string): Path to the screenshot
   - `message` (string): Success message
   - `warnings` (string[], optional): Captions or the table of contents that could not be inserted
