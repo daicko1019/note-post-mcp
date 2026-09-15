@@ -50,6 +50,24 @@ async function waitForPublished(context: BrowserContext, editorUrl: string, time
 }
 
 // 現在時刻のフォーマット
+// 画像の多い記事は縦に長く、全体のスクリーンショットが撮れないことがある（Page.captureScreenshot の失敗、2026-09 確認）。
+// 保存や公開は済んでいるので、撮れなければ見えている範囲だけ撮り、それも駄目なら warnings に出して続ける
+async function takeScreenshot(page: Page, screenshotPath: string, warnings: string[]): Promise<string | undefined> {
+  try {
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    return screenshotPath;
+  } catch {
+    try {
+      await page.screenshot({ path: screenshotPath });
+      warnings.push('ページ全体のスクリーンショットが撮れなかったので、見えている範囲だけ撮りました');
+      return screenshotPath;
+    } catch (e) {
+      warnings.push(`スクリーンショットを撮れませんでした: ${e instanceof Error ? e.message.split('\n')[0] : String(e)}`);
+      return undefined;
+    }
+  }
+}
+
 function nowStr(): string {
   const d = new Date();
   const z = (n: number) => String(n).padStart(2, '0');
@@ -761,7 +779,7 @@ async function postToNote(params: {
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
       }
 
-      await page.screenshot({ path: screenshotPath, fullPage: true });
+      const screenshot = await takeScreenshot(page, screenshotPath, warnings);
       const finalUrl = page.url();
       log('Draft saved', { url: finalUrl });
 
@@ -771,7 +789,7 @@ async function postToNote(params: {
       return {
         success: true,
         url: finalUrl,
-        screenshot: screenshotPath,
+        screenshot,
         message: '下書きを保存しました',
         ...(warnings.length ? { warnings } : {}),
       };
@@ -825,7 +843,7 @@ async function postToNote(params: {
     ]);
 
     const publishedUrl = await waitForPublished(context, page.url());
-    await page.screenshot({ path: screenshotPath, fullPage: true });
+    const screenshot = await takeScreenshot(page, screenshotPath, warnings);
     if (!publishedUrl) {
       throw new Error(`投稿後、記事が公開の状態になったことを確認できませんでした（下書きのまま残っている可能性があります）: ${page.url()}`);
     }
@@ -837,7 +855,7 @@ async function postToNote(params: {
     return {
       success: true,
       url: publishedUrl,
-      screenshot: screenshotPath,
+      screenshot,
       message: '記事を公開しました',
       ...(warnings.length ? { warnings } : {}),
     };
