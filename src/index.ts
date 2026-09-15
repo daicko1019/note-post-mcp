@@ -64,9 +64,12 @@ interface ImageInfo {
   placeholder: string;
 }
 
+// 画像の記法: ![代替テキスト（ALT）](パス "キャプション")。キャプションは省略できる
+const IMAGE_MD = /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/;
+
 // Markdownから画像パスを抽出する関数
 function extractImages(markdown: string, baseDir: string): ImageInfo[] {
-  const imageRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  const imageRegex = new RegExp(IMAGE_MD.source, 'g');
   const images: ImageInfo[] = [];
   let match;
 
@@ -338,7 +341,7 @@ async function postToNote(params: {
     let previousLineWasList = false; // 前の行がリスト項目だったかを追跡
     let previousLineWasQuote = false; // 前の行が引用だったかを追跡
     let previousLineWasHorizontalRule = false; // 前の行が水平線だったかを追跡
-    const imageCaptions: string[] = []; // 貼り付けた画像の alt（本文入力後にキャプションとして入れる）
+    const pastedImages: { alt: string; caption: string }[] = []; // 貼り付けた画像の ALT とキャプション（本文入力後に入れる）
     const warnings: string[] = [];
 
     for (let i = 0; i < lines.length; i++) {
@@ -406,7 +409,7 @@ async function postToNote(params: {
       previousLineWasHorizontalRule = false;
       
       // 画像マークダウンを検出
-      const imageMatch = line.match(/!\[([^\]]*)\]\(([^)]+)\)/);
+      const imageMatch = line.match(IMAGE_MD);
       if (imageMatch) {
         const imagePath = imageMatch[2];
         // ローカルパスの画像をアップロード
@@ -469,7 +472,7 @@ async function postToNote(params: {
             await page.waitForTimeout(300);
 
             log('Inline image pasted');
-            imageCaptions.push(imageMatch[1]);
+            pastedImages.push({ alt: imageMatch[1], caption: imageMatch[3] ?? '' });
 
             // 画像の後に改行してテキストボックスに戻る
             if (!isLastLine) {
@@ -576,17 +579,38 @@ async function postToNote(params: {
     // 引用やリンクカードも figure だが img を含まないので、figure:has(img) で画像だけを数える。
     const imageFigures = bodyBox.locator('figure:has(img)');
     const figureCount = await imageFigures.count();
-    if (figureCount !== imageCaptions.length) {
-      warnings.push(`画像の数が合わないためキャプションを入れていません（本文の画像 ${figureCount} / 貼り付け ${imageCaptions.length}）`);
+    if (figureCount !== pastedImages.length) {
+      warnings.push(`画像の数が合わないためキャプションと ALT を入れていません（本文の画像 ${figureCount} / 貼り付け ${pastedImages.length}）`);
     } else {
-      for (let i = 0; i < imageCaptions.length; i++) {
-        if (!imageCaptions[i].trim()) continue;
-        const caption = imageFigures.nth(i).locator('figcaption');
-        await caption.scrollIntoViewIfNeeded();
-        await caption.click();
-        await page.keyboard.type(imageCaptions[i]);
-        if ((await caption.textContent())?.trim() !== imageCaptions[i].trim()) {
-          warnings.push(`キャプションが入りませんでした: ${imageCaptions[i]}`);
+      for (let i = 0; i < pastedImages.length; i++) {
+        const { alt, caption: captionText } = pastedImages[i];
+        if (captionText.trim()) {
+          const caption = imageFigures.nth(i).locator('figcaption');
+          await caption.scrollIntoViewIfNeeded();
+          await caption.click();
+          await page.keyboard.type(captionText);
+          if ((await caption.textContent())?.trim() !== captionText.trim()) {
+            warnings.push(`キャプションが入りませんでした: ${captionText}`);
+          }
+        }
+
+        // 代替テキスト（ALT）: 画像を選ぶと出る操作バーの「代替テキスト」から入れる
+        if (!alt.trim()) {
+          warnings.push(`画像 ${i + 1} に ALT がありません（![ALT](パス) の [] が空）`);
+          continue;
+        }
+        try {
+          const img = imageFigures.nth(i).locator('img');
+          await img.scrollIntoViewIfNeeded();
+          await img.click();
+          await page.locator('[role="toolbar"] button[aria-label="代替テキスト"]').click({ timeout: 5000 });
+          await page.locator('textarea[placeholder^="例: "]').fill(alt, { timeout: 5000 });
+          await page.getByRole('button', { name: '適用', exact: true }).click({ timeout: 5000 });
+          await page.waitForTimeout(300);
+          if ((await img.getAttribute('alt')) !== alt) throw new Error('img の alt に反映されない');
+        } catch (e) {
+          await page.keyboard.press('Escape').catch(() => {});
+          warnings.push(`ALT を入れられませんでした（画像 ${i + 1}）: ${e instanceof Error ? e.message.split('\n')[0] : String(e)}`);
         }
       }
     }
