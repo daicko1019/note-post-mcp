@@ -225,7 +225,7 @@ Publishes an article to note.com from a Markdown file.
   - `url` (string): URL of the published article (`https://note.com/<user>/n/<key>`). Success is decided by the article's status in note's API becoming `published`; if that is not confirmed within 30 seconds, the tool returns an error instead
   - `screenshot` (string): Path to the screenshot
   - `message` (string): Success message
-  - `warnings` (string[], optional): Captions or the table of contents that could not be inserted
+  - `warnings` (string[], optional): Captions, ALT text, links or the table of contents that could not be inserted
 
 ### save_draft
 
@@ -243,7 +243,7 @@ Saves a draft article to note.com from a Markdown file.
   - `url` (string): URL of the draft editor page
   - `screenshot` (string): Path to the screenshot
   - `message` (string): Success message
-  - `warnings` (string[], optional): Captions or the table of contents that could not be inserted
+  - `warnings` (string[], optional): Captions, ALT text, links or the table of contents that could not be inserted
 
 ## Markdown File Format
 
@@ -303,6 +303,11 @@ The body content supports the following Markdown elements:
 - Supports PNG, JPEG, and GIF formats (JPEG/GIF are converted to PNG before pasting)
 - Local image files are automatically uploaded
 - After the body is entered, the alt text is set as the image's 代替テキスト (ALT) and the optional quoted title as its caption. An image without alt text is reported in `warnings`
+- To link an image, wrap it on its own line: `[![alt text](./images/banner.png "caption")](https://example.com/)`. The link is set from the image toolbar's リンク button
+
+**Links in Text:**
+- `[text](https://example.com/)` inside a line becomes a text link (a URL alone on its own line still becomes a link card)
+- Several links to the same site show identical link cards; use text links or linked images to tell them apart
 
 **Table of Contents:**
 - A line containing only `[目次]` is replaced with note's table-of-contents block
