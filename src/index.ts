@@ -188,9 +188,13 @@ async function postToNote(params: {
   });
 
   try {
+    // UA に HeadlessChrome が入ると editor.note.com → note.com/api の CORS プリフライトが拒否され、エディタが開かない（2026-09 確認）
+    const platform = process.platform === 'darwin' ? 'Macintosh; Intel Mac OS X 10_15_7'
+      : process.platform === 'win32' ? 'Windows NT 10.0; Win64; x64' : 'X11; Linux x86_64';
     const context = await browser.newContext({
       storageState: statePath,
       locale: 'ja-JP',
+      userAgent: `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Safari/537.36`,
       permissions: ['clipboard-read', 'clipboard-write'],
     });
     const page = await context.newPage();
@@ -402,8 +406,15 @@ async function postToNote(params: {
             // クリップボードに画像を設定するためのJavaScriptを実行
             await page.evaluate(async ({ base64, mime }) => {
               const response = await fetch(`data:${mime};base64,${base64}`);
-              const blob = await response.blob();
-              const item = new ClipboardItem({ [mime]: blob });
+              let blob = await response.blob();
+              // Clipboard API は image/png しか書き込めないため、JPEG/GIF は canvas で PNG に変換する
+              if (mime !== 'image/png') {
+                const bitmap = await createImageBitmap(blob);
+                const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+                canvas.getContext('2d')!.drawImage(bitmap, 0, 0);
+                blob = await canvas.convertToBlob({ type: 'image/png' });
+              }
+              const item = new ClipboardItem({ 'image/png': blob });
               await navigator.clipboard.write([item]);
             }, { base64: base64Image, mime: mimeType });
             
