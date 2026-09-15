@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { chromium } from 'playwright';
+import { chromium, type Locator, type Page } from 'playwright';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -27,6 +27,11 @@ const DEFAULT_TIMEOUT = parseInt(process.env.NOTE_POST_MCP_TIMEOUT ?? '180000', 
 function log(message: string, data?: any) {
   const timestamp = new Date().toISOString();
   console.error(`[${timestamp}] [${SERVER_NAME}] ${message}`, data ?? '');
+}
+
+// aria-label はボタン自身に付く場合と、内側の svg に付く場合がある（2026-08 の UI 変更で svg 側へ移動）
+function byAriaLabel(page: Page, label: string): Locator {
+  return page.locator(`button[aria-label="${label}"], button:has(svg[aria-label="${label}"])`);
 }
 
 // 現在時刻のフォーマット
@@ -150,6 +155,7 @@ async function postToNote(params: {
   url: string;
   screenshot?: string;
   message: string;
+  warnings?: string[];
 }> {
   const {
     markdownPath,
@@ -211,7 +217,7 @@ async function postToNote(params: {
     // サムネイル画像の設定
     if (thumbnailPath && fs.existsSync(thumbnailPath)) {
       log('Uploading thumbnail image');
-      const candidates = page.locator('button[aria-label="画像を追加"]');
+      const candidates = byAriaLabel(page, '画像を追加');
       await candidates.first().waitFor({ state: 'visible', timeout });
 
       let target = candidates.first();
@@ -284,8 +290,8 @@ async function postToNote(params: {
       await page.waitForLoadState('networkidle', { timeout }).catch(() => {});
 
       // 反映確認
-      const changedBtn = page.locator('button[aria-label="画像を変更"]');
-      const addBtn = page.locator('button[aria-label="画像を追加"]');
+      const changedBtn = byAriaLabel(page, '画像を変更');
+      const addBtn = byAriaLabel(page, '画像を追加');
 
       let applied = false;
       try {
@@ -316,7 +322,9 @@ async function postToNote(params: {
     let previousLineWasList = false; // 前の行がリスト項目だったかを追跡
     let previousLineWasQuote = false; // 前の行が引用だったかを追跡
     let previousLineWasHorizontalRule = false; // 前の行が水平線だったかを追跡
-    
+    const imageCaptions: string[] = []; // 貼り付けた画像の alt（本文入力後にキャプションとして入れる）
+    const warnings: string[] = [];
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       const isLastLine = i === lines.length - 1;
@@ -432,7 +440,8 @@ async function postToNote(params: {
             await page.waitForTimeout(2000);
             
             log('Inline image pasted');
-            
+            imageCaptions.push(imageMatch[1]);
+
             // 画像の後に改行してテキストボックスに戻る
             if (!isLastLine) {
               await page.keyboard.press('Enter');
@@ -509,6 +518,45 @@ async function postToNote(params: {
     
     log('Body set');
 
+    // 画像キャプション: 入力中にキャプションへ移るとキャレット位置が崩れるため、本文を入れ終えてから入れる。
+    // 引用やリンクカードも figure だが img を含まないので、figure:has(img) で画像だけを数える。
+    const imageFigures = bodyBox.locator('figure:has(img)');
+    const figureCount = await imageFigures.count();
+    if (figureCount !== imageCaptions.length) {
+      warnings.push(`画像の数が合わないためキャプションを入れていません（本文の画像 ${figureCount} / 貼り付け ${imageCaptions.length}）`);
+    } else {
+      for (let i = 0; i < imageCaptions.length; i++) {
+        if (!imageCaptions[i].trim()) continue;
+        const caption = imageFigures.nth(i).locator('figcaption');
+        await caption.scrollIntoViewIfNeeded();
+        await caption.click();
+        await page.keyboard.type(imageCaptions[i]);
+        if ((await caption.textContent())?.trim() !== imageCaptions[i].trim()) {
+          warnings.push(`キャプションが入りませんでした: ${imageCaptions[i]}`);
+        }
+      }
+    }
+
+    // 目次: 本文中の「[目次]」だけの段落を空にし、挿入メニューの「目次」で置き換える
+    const tocMarker = bodyBox.locator('p', { hasText: /^\s*\[目次\]\s*$/ }).first();
+    if (await tocMarker.count()) {
+      try {
+        await tocMarker.click();
+        await page.keyboard.press('End');
+        await page.keyboard.press('Shift+Home');
+        await page.keyboard.press('Backspace');
+        await byAriaLabel(page, 'メニューを開く').last().click({ timeout: 5000 });
+        await page.locator('button#toc-setting').click({ timeout: 5000 });
+        await page.waitForTimeout(1000);
+        if (!(await bodyBox.locator('table-of-contents').count())) throw new Error('目次ブロックが見つからない');
+        log('Table of contents inserted');
+      } catch (e) {
+        await page.keyboard.press('Escape').catch(() => {});
+        warnings.push(`目次を入れられませんでした: ${e instanceof Error ? e.message.split('\n')[0] : String(e)}`);
+      }
+    }
+    if (warnings.length) log('Warnings', warnings);
+
     // 下書き保存の場合
     if (!isPublic) {
       const saveBtn = page.locator('button:has-text("下書き保存"), [aria-label*="下書き保存"]').first();
@@ -531,6 +579,7 @@ async function postToNote(params: {
         url: finalUrl,
         screenshot: screenshotPath,
         message: '下書きを保存しました',
+        ...(warnings.length ? { warnings } : {}),
       };
     }
 
@@ -593,6 +642,7 @@ async function postToNote(params: {
       url: finalUrl,
       screenshot: screenshotPath,
       message: '記事を公開しました',
+      ...(warnings.length ? { warnings } : {}),
     };
   } catch (error) {
     await browser.close();
