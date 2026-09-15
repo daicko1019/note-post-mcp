@@ -638,6 +638,21 @@ async function postToNote(params: {
     if (figureCount !== pastedImages.length) {
       warnings.push(`画像の数が合わないためキャプションと ALT を入れていません（本文の画像 ${figureCount} / 貼り付け ${pastedImages.length}）`);
     } else {
+      // 画像 i を選ぶ。前の画像に ALT を入れた直後は、クリックしても選択が移らないことがあり、
+      // 次の画像のリンクが前の画像に入った（2026-09 確認）。選ばれた印（ProseMirror-selectednode）を確かめる
+      const selectImage = async (i: number) => {
+        const fig = imageFigures.nth(i);
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await page.keyboard.press('Escape');
+          await fig.locator('img').scrollIntoViewIfNeeded();
+          await fig.locator('img').click();
+          for (let k = 0; k < 5; k++) {
+            await page.waitForTimeout(200);
+            if (await fig.evaluate((f) => f.classList.contains('ProseMirror-selectednode'))) return;
+          }
+        }
+        throw new Error('画像を選べない');
+      };
       for (let i = 0; i < pastedImages.length; i++) {
         const { alt, caption: captionText, link } = pastedImages[i];
         if (captionText.trim()) {
@@ -653,14 +668,15 @@ async function postToNote(params: {
         // リンク: 画像を選ぶと出る操作バーの「リンク」から入れる
         if (link) {
           try {
-            const img = imageFigures.nth(i).locator('img');
-            await img.scrollIntoViewIfNeeded();
-            await img.click();
+            await selectImage(i);
             await page.locator('[role="toolbar"] button[aria-label="リンク"]').click({ timeout: 5000 });
-            await page.locator('textarea[placeholder="https://"]').fill(link, { timeout: 5000 });
+            await page.locator('textarea[placeholder="https://"]:visible').fill(link, { timeout: 5000 });
             await page.getByRole('button', { name: '適用', exact: true }).click({ timeout: 5000 });
-            await page.waitForTimeout(300);
-            const href = await imageFigures.nth(i).evaluate((f) => f.querySelector('a[href]')?.getAttribute('href') ?? null);
+            let href: string | null = null;
+            for (let k = 0; k < 10 && href !== link; k++) {
+              await page.waitForTimeout(300);
+              href = await imageFigures.nth(i).evaluate((f) => f.querySelector('a[href]')?.getAttribute('href') ?? null);
+            }
             if (href !== link) throw new Error(`figure のリンクに反映されない（${href}）`);
           } catch (e) {
             await page.keyboard.press('Escape').catch(() => {});
@@ -675,8 +691,7 @@ async function postToNote(params: {
         }
         try {
           const img = imageFigures.nth(i).locator('img');
-          await img.scrollIntoViewIfNeeded();
-          await img.click();
+          await selectImage(i);
           await page.locator('[role="toolbar"] button[aria-label="代替テキスト"]').click({ timeout: 5000 });
           await page.locator('textarea[placeholder^="例: "]').fill(alt, { timeout: 5000 });
           await page.getByRole('button', { name: '適用', exact: true }).click({ timeout: 5000 });
@@ -693,7 +708,22 @@ async function postToNote(params: {
     const tocMarker = bodyBox.locator('p', { hasText: /^\s*\[目次\]\s*$/ }).first();
     if (await tocMarker.count()) {
       try {
-        await tocMarker.click();
+        // キャレットが「[目次]」の段落に入ったことを確かめてから消す。
+        // 直前に ALT を入れた画像が選ばれたままクリックが効かず、Backspace でその画像が消えて同じ場所に目次が入った（2026-09 確認）
+        const imagesBeforeToc = await bodyBox.locator('figure:has(img)').count();
+        await page.keyboard.press('Escape');
+        let inMarker = false;
+        for (let attempt = 0; attempt < 3 && !inMarker; attempt++) {
+          await tocMarker.evaluate((el) => el.scrollIntoView({ block: 'center' }));
+          await tocMarker.click();
+          await page.waitForTimeout(300);
+          inMarker = await page.evaluate(() => {
+            const node = window.getSelection()?.anchorNode;
+            const el = node instanceof Element ? node : node?.parentElement;
+            return el?.closest('p')?.textContent?.trim() === '[目次]';
+          });
+        }
+        if (!inMarker) throw new Error('「[目次]」の段落にキャレットを置けない');
         await page.keyboard.press('End');
         await page.keyboard.press('Shift+Home');
         await page.keyboard.press('Backspace');
@@ -701,6 +731,7 @@ async function postToNote(params: {
         await page.locator('button#toc-setting').click({ timeout: 5000 });
         await page.waitForTimeout(1000);
         if (!(await bodyBox.locator('table-of-contents').count())) throw new Error('目次ブロックが見つからない');
+        if ((await bodyBox.locator('figure:has(img)').count()) !== imagesBeforeToc) throw new Error('目次を入れる操作で画像の数が変わった');
         log('Table of contents inserted');
       } catch (e) {
         await page.keyboard.press('Escape').catch(() => {});
