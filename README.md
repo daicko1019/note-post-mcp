@@ -225,6 +225,7 @@ Publishes an article to note.com from a Markdown file.
   - `url` (string): URL of the published article
   - `screenshot` (string): Path to the screenshot
   - `message` (string): Success message
+  - `warnings` (string[], optional): Captions or the table of contents that could not be inserted
 
 ### save_draft
 
@@ -242,6 +243,7 @@ Saves a draft article to note.com from a Markdown file.
   - `url` (string): URL of the draft editor page
   - `screenshot` (string): Path to the screenshot
   - `message` (string): Success message
+  - `warnings` (string[], optional): Captions or the table of contents that could not be inserted
 
 ## Markdown File Format
 
@@ -298,8 +300,12 @@ The body content supports the following Markdown elements:
 
 **Image Insertion:**
 - Use relative paths from the Markdown file: `![description](./images/sample.png)`
-- Supports PNG, JPEG, and GIF formats
+- Supports PNG, JPEG, and GIF formats (JPEG/GIF are converted to PNG before pasting)
 - Local image files are automatically uploaded
+- The alt text (`description` above) is set as the image caption after the body is entered; leave it empty for no caption
+
+**Table of Contents:**
+- A line containing only `[目次]` is replaced with note's table-of-contents block
 
 **Lists and Quotes:**
 - Bullet lists (`-`) and numbered lists (`1.`) are automatically continued by note.com
