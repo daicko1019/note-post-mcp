@@ -299,10 +299,10 @@ The body content supports the following Markdown elements:
 - Entire code blocks are pasted as a unit
 
 **Image Insertion:**
-- Use relative paths from the Markdown file: `![description](./images/sample.png)`
+- Use relative paths from the Markdown file: `![alt text](./images/sample.png "caption")`
 - Supports PNG, JPEG, and GIF formats (JPEG/GIF are converted to PNG before pasting)
 - Local image files are automatically uploaded
-- The alt text (`description` above) is set as the image caption after the body is entered; leave it empty for no caption
+- After the body is entered, the alt text is set as the image's 代替テキスト (ALT) and the optional quoted title as its caption. An image without alt text is reported in `warnings`
 
 **Table of Contents:**
 - A line containing only `[目次]` is replaced with note's table-of-contents block
