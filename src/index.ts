@@ -520,6 +520,13 @@ async function postToNote(params: {
       // 現在の行が引用かどうかをチェック
       const isQuote = /^>/.test(line);
       
+      // 箇条書きの1行目は、段落の先頭で「- 」を打たないと note がリストに変えてくれない。
+      // 直前が本文の行だと Enter 1回では段落内の改行（<br>）にしかならず、「- 」が文字として残った（2026-09 確認）
+      if (isCurrentLineList && !previousLineWasList && i > 0 && lines[i - 1].trim() !== '') {
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(150);
+      }
+
       // 通常のテキスト行を入力
       let processedLine = line;
       
