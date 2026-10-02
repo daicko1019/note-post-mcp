@@ -760,13 +760,46 @@ async function postToNote(params: {
           });
         }
         if (!inMarker) throw new Error('「[目次]」の段落にキャレットを置けない');
+        // 「[目次]」の段落を覚えておく（文字を消すと hasText では見つからなくなるため、やり直しのときにここへ戻る）
+        const markerHandle = await tocMarker.elementHandle();
         await page.keyboard.press('End');
         await page.keyboard.press('Shift+Home');
         await page.keyboard.press('Backspace');
-        await byAriaLabel(page, 'メニューを開く').last().click({ timeout: 5000 });
-        await page.locator('button#toc-setting').click({ timeout: 5000 });
-        await page.waitForTimeout(1000);
-        if (!(await bodyBox.locator('table-of-contents').count())) throw new Error('目次ブロックが見つからない');
+        // 行頭のメニュー → 「目次」。メニューの表示が遅れて 5 秒で時間切れになったことがある（2026-10-02、15 回に 1 回）。
+        // 待ちを 10 秒に延ばし、だめなら空になった段落にキャレットを戻して最大 3 回やり直す
+        let lastError: unknown = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            if (attempt > 0) {
+              await page.keyboard.press('Escape').catch(() => {});
+              if (markerHandle) {
+                await markerHandle.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: 'center' }));
+                await markerHandle.click();
+              }
+              await page.waitForTimeout(500 * attempt);
+            }
+            const menu = byAriaLabel(page, 'メニューを開く').last();
+            await menu.waitFor({ state: 'visible', timeout: 10000 });
+            await menu.click({ timeout: 10000 });
+            const tocButton = page.locator('button#toc-setting');
+            await tocButton.waitFor({ state: 'visible', timeout: 10000 });
+            await tocButton.click({ timeout: 10000 });
+            await page.waitForTimeout(1000);
+            if (await bodyBox.locator('table-of-contents').count()) { lastError = null; break; }
+            lastError = new Error('目次ブロックが見つからない');
+          } catch (e) {
+            lastError = e;
+            log(`目次の挿入をやり直す（${attempt + 1} 回目が失敗）`, { error: e instanceof Error ? e.message.split('\n')[0] : String(e) });
+          }
+        }
+        if (lastError) {
+          if (screenshotDir) {
+            const shot = path.join(screenshotDir, `toc-failed-${Date.now()}.png`);
+            await page.screenshot({ path: shot }).catch(() => {});
+            log('目次を入れられなかった画面', { path: shot });
+          }
+          throw lastError;
+        }
         if ((await bodyBox.locator('figure:has(img)').count()) !== imagesBeforeToc) throw new Error('目次を入れる操作で画像の数が変わった');
         log('Table of contents inserted');
       } catch (e) {
